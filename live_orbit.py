@@ -9,13 +9,26 @@ from PIL import Image, ImageTk
 from train_orbit import OrbitGenerator
 
 
-def make_angle_code(angle_degrees: float, device: torch.device) -> torch.Tensor:
-    radians = math.radians(angle_degrees % 360.0)
-    return torch.tensor(
-        [[math.sin(radians), math.cos(radians)]],
-        dtype=torch.float32,
-        device=device,
-    )
+def make_camera_code(
+    azimuth_degrees: float,
+    elevation_degrees: float,
+    elevation_strength: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Map azimuth and experimental elevation into the model's 2D input.
+
+    At elevation 0 this is exactly the training input. Non-zero elevation pushes
+    the code away from the learned unit circle, so it probes extrapolation rather
+    than producing a physically correct top or bottom camera view.
+    """
+    azimuth = math.radians(azimuth_degrees % 360.0)
+    elevation = math.radians(max(-90.0, min(90.0, elevation_degrees)))
+
+    radius = math.cos(elevation)
+    x = math.sin(azimuth) * radius
+    y = math.cos(azimuth) * radius + math.sin(elevation) * elevation_strength
+
+    return torch.tensor([[x, y]], dtype=torch.float32, device=device)
 
 
 def tensor_to_image(tensor: torch.Tensor) -> Image.Image:
@@ -38,7 +51,8 @@ class OrbitPreview:
         self.model.load_state_dict(saved.get("model", saved))
         self.model.eval()
 
-        self.angle = 0.0
+        self.azimuth = 0.0
+        self.elevation = 0.0
         self.speed = args.speed
         self.playing = True
         self.running = True
@@ -65,13 +79,26 @@ class OrbitPreview:
         )
         self.info_label.pack(fill="x")
 
-        self.root.bind("<Left>", lambda event: self.step_angle(-1.0))
-        self.root.bind("<Right>", lambda event: self.step_angle(1.0))
+        self.warning_label = tk.Label(
+            self.root,
+            text="Elevation is an off-manifold experiment, not a trained camera axis.",
+            fg="#ffcc66",
+            bg="black",
+            font=("Consolas", 10),
+        )
+        self.warning_label.pack(fill="x")
+
+        self.root.bind("<Left>", lambda event: self.step_azimuth(-1.0))
+        self.root.bind("<Right>", lambda event: self.step_azimuth(1.0))
+        self.root.bind("<Up>", lambda event: self.step_elevation(1.0))
+        self.root.bind("<Down>", lambda event: self.step_elevation(-1.0))
+        self.root.bind("<Home>", lambda event: self.reset_elevation())
         self.root.bind("<space>", lambda event: self.toggle_play())
         self.root.bind("<Button-1>", self.start_drag)
         self.root.bind("<B1-Motion>", self.drag)
 
         self.drag_x = None
+        self.drag_y = None
         self.photo = None
         self.root.after(0, self.update)
 
@@ -82,21 +109,43 @@ class OrbitPreview:
     def toggle_play(self):
         self.playing = not self.playing
 
-    def step_angle(self, amount: float):
+    def step_azimuth(self, amount: float):
         self.playing = False
-        self.angle = (self.angle + amount) % 360.0
+        self.azimuth = (self.azimuth + amount) % 360.0
+
+    def step_elevation(self, amount: float):
+        self.playing = False
+        self.elevation = max(-90.0, min(90.0, self.elevation + amount))
+
+    def reset_elevation(self):
+        self.elevation = 0.0
 
     def start_drag(self, event):
         self.playing = False
         self.drag_x = event.x
+        self.drag_y = event.y
 
     def drag(self, event):
-        if self.drag_x is None:
+        if self.drag_x is None or self.drag_y is None:
             self.drag_x = event.x
+            self.drag_y = event.y
             return
-        delta = event.x - self.drag_x
+
+        delta_x = event.x - self.drag_x
+        delta_y = event.y - self.drag_y
         self.drag_x = event.x
-        self.angle = (self.angle + delta * self.args.drag_sensitivity) % 360.0
+        self.drag_y = event.y
+
+        self.azimuth = (
+            self.azimuth + delta_x * self.args.drag_sensitivity
+        ) % 360.0
+        self.elevation = max(
+            -90.0,
+            min(
+                90.0,
+                self.elevation - delta_y * self.args.drag_sensitivity,
+            ),
+        )
 
     def update(self):
         if not self.running:
@@ -107,9 +156,15 @@ class OrbitPreview:
         self.last_time = now
 
         if self.playing:
-            self.angle = (self.angle + self.speed * delta_time) % 360.0
+            self.azimuth = (self.azimuth + self.speed * delta_time) % 360.0
 
-        code = make_angle_code(self.angle, self.device)
+        code = make_camera_code(
+            self.azimuth,
+            self.elevation,
+            self.args.elevation_strength,
+            self.device,
+        )
+
         with torch.inference_mode():
             with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
                 output = self.model(code)[0]
@@ -133,13 +188,15 @@ class OrbitPreview:
         state = "PLAY" if self.playing else "PAUSE"
         self.info_label.configure(
             text=(
-                f"Angle: {self.angle:7.2f} deg   "
+                f"Azimuth: {self.azimuth:7.2f} deg   "
+                f"Elevation: {self.elevation:6.1f} deg   "
                 f"FPS: {self.live_fps:7.2f}   "
-                f"Speed: {self.speed:6.1f} deg/s   "
                 f"{state}"
             )
         )
-        self.root.title(f"AIModel Tree Orbit - {self.angle:.1f} deg")
+        self.root.title(
+            f"AIModel Tree Orbit - az {self.azimuth:.1f}, el {self.elevation:.1f}"
+        )
         self.root.after(1, self.update)
 
     def run(self):
@@ -152,6 +209,12 @@ def main():
     parser.add_argument("--window-size", type=int, default=512)
     parser.add_argument("--speed", type=float, default=45.0)
     parser.add_argument("--drag-sensitivity", type=float, default=0.5)
+    parser.add_argument(
+        "--elevation-strength",
+        type=float,
+        default=1.0,
+        help="How aggressively vertical movement pushes outside the learned orbit",
+    )
     args = parser.parse_args()
 
     app = OrbitPreview(args)
