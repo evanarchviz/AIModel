@@ -12,16 +12,32 @@ from torchvision import transforms
 from torchvision.utils import save_image
 
 
+ELEVATION_FOLDERS = {
+    15.0: "15",
+    30.0: "30",
+    45.0: "45",
+}
+
+
 class OrbitDataset(Dataset):
     def __init__(self, root: str):
-        self.files = sorted(Path(root).glob("*.png"))
-        if len(self.files) != 360:
-            raise ValueError(f"Expected exactly 360 PNG files, found {len(self.files)}")
+        self.root = Path(root)
+        self.samples = []
 
-        expected = [f"{index:04d}.png" for index in range(1, 361)]
-        actual = [path.name for path in self.files]
-        if actual != expected:
-            raise ValueError("Files must be named 0001.png through 0360.png with no gaps")
+        self._add_ring(
+            folder=self.root,
+            elevation=0.0,
+            count=360,
+            azimuth_step=1.0,
+        )
+
+        for elevation, folder_name in ELEVATION_FOLDERS.items():
+            self._add_ring(
+                folder=self.root / folder_name,
+                elevation=elevation,
+                count=72,
+                azimuth_step=5.0,
+            )
 
         self.transform = transforms.Compose(
             [
@@ -31,24 +47,57 @@ class OrbitDataset(Dataset):
             ]
         )
 
+    def _add_ring(
+        self,
+        folder: Path,
+        elevation: float,
+        count: int,
+        azimuth_step: float,
+    ):
+        if not folder.exists():
+            raise FileNotFoundError(f"Missing orbit folder: {folder}")
+
+        expected = [folder / f"{index:04d}.png" for index in range(1, count + 1)]
+        missing = [path.name for path in expected if not path.exists()]
+        if missing:
+            raise ValueError(
+                f"{folder} is missing {len(missing)} expected files. "
+                f"First missing file: {missing[0]}"
+            )
+
+        extras = sorted(folder.glob("*.png"))
+        if len(extras) != count:
+            raise ValueError(
+                f"Expected exactly {count} PNG files in {folder}, found {len(extras)}"
+            )
+
+        for index, path in enumerate(expected):
+            self.samples.append(
+                {
+                    "path": path,
+                    "azimuth": index * azimuth_step,
+                    "elevation": elevation,
+                }
+            )
+
     def __len__(self):
-        return len(self.files)
+        return len(self.samples)
 
     def __getitem__(self, index):
-        image = self.transform(Image.open(self.files[index]).convert("RGB"))
-        angle = math.radians(index)
-        angle_code = torch.tensor(
-            [math.sin(angle), math.cos(angle)],
-            dtype=torch.float32,
+        sample = self.samples[index]
+        image = self.transform(Image.open(sample["path"]).convert("RGB"))
+        code = make_camera_code(
+            sample["azimuth"],
+            sample["elevation"],
         )
-        return angle_code, image
+        return code, image
 
 
 class OrbitGenerator(nn.Module):
     def __init__(self, hidden=256, base=64):
         super().__init__()
         self.mapping = nn.Sequential(
-            nn.Linear(2, hidden),
+            nn.Linear(4, hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.SiLU(),
@@ -80,21 +129,39 @@ class OrbitGenerator(nn.Module):
             nn.Tanh(),
         )
 
-    def forward(self, angle_code):
-        features = self.mapping(angle_code)
-        features = features.view(angle_code.shape[0], self.base * 16, 4, 4)
+    def forward(self, camera_code):
+        features = self.mapping(camera_code)
+        features = features.view(camera_code.shape[0], self.base * 16, 4, 4)
         return self.to_rgb(self.decoder(features))
 
 
-def angle_code(degrees, device):
-    radians = torch.deg2rad(degrees)
-    return torch.stack((torch.sin(radians), torch.cos(radians)), dim=1).to(device)
+def make_camera_code(azimuth_degrees, elevation_degrees):
+    azimuth = math.radians(float(azimuth_degrees))
+    elevation = math.radians(float(elevation_degrees))
+    return torch.tensor(
+        [
+            math.sin(azimuth),
+            math.cos(azimuth),
+            math.sin(elevation),
+            math.cos(elevation),
+        ],
+        dtype=torch.float32,
+    )
+
+
+def make_camera_codes(azimuths, elevations, device):
+    codes = [
+        make_camera_code(azimuth, elevation)
+        for elevation in elevations
+        for azimuth in azimuths
+    ]
+    return torch.stack(codes).to(device)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
-    parser.add_argument("--out", default="runs/orbit_tree")
+    parser.add_argument("--out", default="runs/orbit_tree_elevation")
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -112,7 +179,10 @@ def main():
         print(torch.cuda.get_device_name(0))
 
     dataset = OrbitDataset(args.data)
-    print("Loaded 360 orbit images: 0001.png -> 0 degrees, 0360.png -> 359 degrees")
+    print(
+        f"Loaded {len(dataset)} images: "
+        "360 at 0 degrees and 72 each at +15, +30, +45 degrees"
+    )
 
     loader = DataLoader(
         dataset,
@@ -132,7 +202,8 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    sample_degrees = torch.arange(0, 360, 15, dtype=torch.float32, device=device)
+    sample_azimuths = list(range(0, 360, 45))
+    sample_elevations = [0.0, 15.0, 30.0, 45.0]
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -159,13 +230,17 @@ def main():
         if epoch == 1 or epoch % args.sample_every == 0:
             model.eval()
             with torch.inference_mode():
-                codes = angle_code(sample_degrees, device)
+                codes = make_camera_codes(
+                    sample_azimuths,
+                    sample_elevations,
+                    device,
+                )
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                     samples = model(codes).float()
                 save_image(
                     samples,
                     samples_dir / f"epoch_{epoch:04d}.png",
-                    nrow=6,
+                    nrow=len(sample_azimuths),
                     normalize=True,
                     value_range=(-1, 1),
                 )
@@ -174,6 +249,8 @@ def main():
                 {
                     "epoch": epoch,
                     "model": model.state_dict(),
+                    "camera_code_dimensions": 4,
+                    "elevations": [0.0, 15.0, 30.0, 45.0],
                 },
                 checkpoints_dir / "latest.pt",
             )
