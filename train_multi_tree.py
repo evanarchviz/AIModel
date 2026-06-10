@@ -150,7 +150,7 @@ def build_memory(model, episodes, device):
             elevation_batch,
             memory.index_select(0, active_tensor),
         )
-        memory = memory.index_copy(0, active_tensor, updated)
+        memory = memory.index_copy(0, active_tensor, updated.to(memory.dtype))
 
     return memory
 
