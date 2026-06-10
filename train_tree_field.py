@@ -1,5 +1,4 @@
 import argparse
-import math
 import random
 from pathlib import Path
 
@@ -21,12 +20,13 @@ ELEVATION_FOLDERS = {
 
 
 class TreeFieldDataset:
-    def __init__(self, root: str):
+    def __init__(self, root: str, resolution: int):
         self.root = Path(root)
+        self.resolution = resolution
         self.samples = []
         self.transform = transforms.Compose(
             [
-                transforms.Resize((128, 128), antialias=True),
+                transforms.Resize((resolution, resolution), antialias=True),
                 transforms.ToTensor(),
             ]
         )
@@ -87,7 +87,8 @@ def total_variation(grid: torch.Tensor) -> torch.Tensor:
 
 def sample_training_batch(dataset, batch_size, rays_per_view, device):
     view_indices = torch.randint(0, len(dataset), (batch_size,))
-    pixel_indices = torch.randint(0, 128 * 128, (rays_per_view,))
+    pixel_count = dataset.resolution * dataset.resolution
+    pixel_indices = torch.randint(0, pixel_count, (rays_per_view,))
 
     images = torch.stack(
         [dataset.images[index] for index in view_indices.tolist()]
@@ -103,15 +104,15 @@ def sample_training_batch(dataset, batch_size, rays_per_view, device):
         device=device,
     )
 
-    ys = torch.div(pixel_indices, 128, rounding_mode="floor")
-    xs = pixel_indices % 128
+    ys = torch.div(pixel_indices, dataset.resolution, rounding_mode="floor")
+    xs = pixel_indices % dataset.resolution
     targets = images[:, :, ys, xs].permute(0, 2, 1).contiguous()
     masks = (targets.amax(dim=-1) > 0.02).float()
 
     return azimuths, elevations, pixel_indices, targets, masks
 
 
-def render_validation_grid(model, config, device, output_path):
+def render_validation_grid(model, config, device, output_path, ray_chunk):
     azimuths = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0]
     elevations = [0.0, 7.5, 15.0, 22.5, 30.0, 37.5, 45.0]
     images = []
@@ -125,7 +126,7 @@ def render_validation_grid(model, config, device, output_path):
                     elevation,
                     config,
                     device,
-                    ray_chunk=2048,
+                    ray_chunk=ray_chunk,
                 )
                 images.append(rgb.permute(2, 0, 1).cpu())
 
@@ -141,11 +142,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
     parser.add_argument("--out", default="runs/tree_field")
+    parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--rays-per-view", type=int, default=4096)
     parser.add_argument("--samples-per-ray", type=int, default=48)
     parser.add_argument("--field-resolution", type=int, default=64)
+    parser.add_argument("--validation-ray-chunk", type=int, default=1024)
     parser.add_argument("--fov", type=float, default=35.0)
     parser.add_argument("--radius", type=float, default=3.0)
     parser.add_argument("--near", type=float, default=1.5)
@@ -155,6 +158,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    if args.resolution <= 0:
+        raise ValueError("--resolution must be positive")
+    if args.field_resolution <= 0:
+        raise ValueError("--field-resolution must be positive")
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -163,12 +171,20 @@ def main():
     if device.type == "cuda":
         print(torch.cuda.get_device_name(0))
 
-    dataset = TreeFieldDataset(args.data)
-    print(f"Loaded {len(dataset)} calibrated views")
+    dataset = TreeFieldDataset(args.data, args.resolution)
+    print(
+        f"Loaded {len(dataset)} calibrated views at "
+        f"{args.resolution}x{args.resolution}"
+    )
+    print(
+        f"Field resolution: {args.field_resolution}^3, "
+        f"rays/view: {args.rays_per_view}, "
+        f"samples/ray: {args.samples_per_ray}"
+    )
 
     config = CameraConfig(
-        width=128,
-        height=128,
+        width=args.resolution,
+        height=args.resolution,
         fov_degrees=args.fov,
         radius=args.radius,
         near=args.near,
@@ -251,6 +267,7 @@ def main():
                     "model": model.state_dict(),
                     "field_resolution": args.field_resolution,
                     "camera_config": vars(config),
+                    "training_resolution": args.resolution,
                 },
                 checkpoint_path,
             )
@@ -260,6 +277,7 @@ def main():
                 config,
                 device,
                 samples_dir / f"step_{step:05d}.png",
+                ray_chunk=args.validation_ray_chunk,
             )
             model.train()
 
