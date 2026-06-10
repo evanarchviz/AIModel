@@ -216,11 +216,19 @@ def main():
                 model.color_grid
             )
 
-        opacity_loss = F.binary_cross_entropy(
-            predicted_opacity.float().clamp(1e-5, 1.0 - 1e-5),
-            masks.float(),
+        predicted_opacity_f32 = predicted_opacity.float().clamp(1e-5, 1.0 - 1e-5)
+        masks_f32 = masks.float()
+        opacity_loss = F.binary_cross_entropy(predicted_opacity_f32, masks_f32)
+        opacity_binary_loss = (
+            predicted_opacity_f32 * (1.0 - predicted_opacity_f32)
+        ).mean()
+
+        loss = (
+            rgb_loss.float()
+            + 0.5 * opacity_loss
+            + 0.05 * opacity_binary_loss
+            + 1e-5 * tv_loss.float()
         )
-        loss = rgb_loss.float() + 0.1 * opacity_loss + 1e-5 * tv_loss.float()
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -231,7 +239,8 @@ def main():
                 f"Step {step:05d}/{args.steps} "
                 f"loss={loss.item():.6f} "
                 f"rgb={rgb_loss.item():.6f} "
-                f"opacity={opacity_loss.item():.6f}"
+                f"opacity={opacity_loss.item():.6f} "
+                f"binary={opacity_binary_loss.item():.6f}"
             )
 
         if step == 1 or step % args.checkpoint_every == 0:
