@@ -31,7 +31,26 @@ class TreeFieldDataset:
             ]
         )
 
-        self._add_ring(self.root, elevation=0.0, count=360, step=1.0)
+        root_pngs = sorted(self.root.glob("*.png"))
+        if len(root_pngs) == 359:
+            root_count = 359
+            root_step = 360.0 / 359.0
+        elif len(root_pngs) == 360:
+            root_count = 360
+            root_step = 1.0
+        else:
+            raise ValueError(
+                f"Expected 359 or 360 root PNG files in {self.root}, "
+                f"found {len(root_pngs)}"
+            )
+
+        self._add_ring(
+            self.root,
+            elevation=0.0,
+            count=root_count,
+            step=root_step,
+        )
+
         for elevation, folder_name in ELEVATION_FOLDERS.items():
             if elevation == 0.0:
                 continue
@@ -46,6 +65,11 @@ class TreeFieldDataset:
             self.transform(Image.open(sample["path"]).convert("RGB"))
             for sample in self.samples
         ]
+
+        print(
+            f"Root ring: {root_count} unique views, "
+            f"{root_step:.6f} degrees per frame"
+        )
 
     def _add_ring(self, folder: Path, elevation: float, count: int, step: float):
         if not folder.exists():
