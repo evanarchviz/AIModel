@@ -42,7 +42,10 @@ class TreeFieldDataset:
                 step=5.0,
             )
 
-        self.images = [self.transform(Image.open(sample["path"]).convert("RGB")) for sample in self.samples]
+        self.images = [
+            self.transform(Image.open(sample["path"]).convert("RGB"))
+            for sample in self.samples
+        ]
 
     def _add_ring(self, folder: Path, elevation: float, count: int, step: float):
         if not folder.exists():
@@ -86,7 +89,9 @@ def sample_training_batch(dataset, batch_size, rays_per_view, device):
     view_indices = torch.randint(0, len(dataset), (batch_size,))
     pixel_indices = torch.randint(0, 128 * 128, (rays_per_view,))
 
-    images = torch.stack([dataset.images[index] for index in view_indices.tolist()]).to(device)
+    images = torch.stack(
+        [dataset.images[index] for index in view_indices.tolist()]
+    ).to(device)
     azimuths = torch.tensor(
         [dataset.samples[index]["azimuth"] for index in view_indices.tolist()],
         dtype=torch.float32,
@@ -206,14 +211,16 @@ def main():
                 config,
                 randomized=True,
             )
-
             rgb_loss = F.smooth_l1_loss(predicted_rgb, targets)
-            opacity_loss = F.binary_cross_entropy(
-                predicted_opacity.clamp(1e-5, 1.0 - 1e-5),
-                masks,
+            tv_loss = total_variation(model.density_grid) + 0.25 * total_variation(
+                model.color_grid
             )
-            tv_loss = total_variation(model.density_grid) + 0.25 * total_variation(model.color_grid)
-            loss = rgb_loss + 0.1 * opacity_loss + 1e-5 * tv_loss
+
+        opacity_loss = F.binary_cross_entropy(
+            predicted_opacity.float().clamp(1e-5, 1.0 - 1e-5),
+            masks.float(),
+        )
+        loss = rgb_loss.float() + 0.1 * opacity_loss + 1e-5 * tv_loss.float()
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
