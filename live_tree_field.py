@@ -76,7 +76,7 @@ class TreeFieldPreview:
 
         self.help_label = tk.Label(
             self.root,
-            text="1: fast  2: balanced  3: quality  |  arrows/mouse: orbit  |  space: pause",
+            text="1: fast  2: balanced  3: quality  4: full 512  |  arrows/mouse: orbit  |  space: pause",
             fg="#bbbbbb",
             bg="black",
             font=("Consolas", 10),
@@ -92,6 +92,7 @@ class TreeFieldPreview:
         self.root.bind("<Key-1>", lambda event: self.set_quality(96, 12))
         self.root.bind("<Key-2>", lambda event: self.set_quality(128, 24))
         self.root.bind("<Key-3>", lambda event: self.set_quality(256, 32))
+        self.root.bind("<Key-4>", lambda event: self.set_quality(512, 64))
         self.root.bind("<Button-1>", self.start_drag)
         self.root.bind("<B1-Motion>", self.drag)
 
