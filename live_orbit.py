@@ -12,23 +12,20 @@ from train_orbit import OrbitGenerator
 def make_camera_code(
     azimuth_degrees: float,
     elevation_degrees: float,
-    elevation_strength: float,
     device: torch.device,
 ) -> torch.Tensor:
-    """Map azimuth and experimental elevation into the model's 2D input.
-
-    At elevation 0 this is exactly the training input. Non-zero elevation pushes
-    the code away from the learned unit circle, so it probes extrapolation rather
-    than producing a physically correct top or bottom camera view.
-    """
     azimuth = math.radians(azimuth_degrees % 360.0)
-    elevation = math.radians(max(-90.0, min(90.0, elevation_degrees)))
-
-    radius = math.cos(elevation)
-    x = math.sin(azimuth) * radius
-    y = math.cos(azimuth) * radius + math.sin(elevation) * elevation_strength
-
-    return torch.tensor([[x, y]], dtype=torch.float32, device=device)
+    elevation = math.radians(elevation_degrees)
+    return torch.tensor(
+        [[
+            math.sin(azimuth),
+            math.cos(azimuth),
+            math.sin(elevation),
+            math.cos(elevation),
+        ]],
+        dtype=torch.float32,
+        device=device,
+    )
 
 
 def tensor_to_image(tensor: torch.Tensor) -> Image.Image:
@@ -79,15 +76,6 @@ class OrbitPreview:
         )
         self.info_label.pack(fill="x")
 
-        self.warning_label = tk.Label(
-            self.root,
-            text="Elevation is an off-manifold experiment, not a trained camera axis.",
-            fg="#ffcc66",
-            bg="black",
-            font=("Consolas", 10),
-        )
-        self.warning_label.pack(fill="x")
-
         self.root.bind("<Left>", lambda event: self.step_azimuth(-1.0))
         self.root.bind("<Right>", lambda event: self.step_azimuth(1.0))
         self.root.bind("<Up>", lambda event: self.step_elevation(1.0))
@@ -115,7 +103,7 @@ class OrbitPreview:
 
     def step_elevation(self, amount: float):
         self.playing = False
-        self.elevation = max(-90.0, min(90.0, self.elevation + amount))
+        self.elevation = max(0.0, min(45.0, self.elevation + amount))
 
     def reset_elevation(self):
         self.elevation = 0.0
@@ -140,9 +128,9 @@ class OrbitPreview:
             self.azimuth + delta_x * self.args.drag_sensitivity
         ) % 360.0
         self.elevation = max(
-            -90.0,
+            0.0,
             min(
-                90.0,
+                45.0,
                 self.elevation - delta_y * self.args.drag_sensitivity,
             ),
         )
@@ -161,7 +149,6 @@ class OrbitPreview:
         code = make_camera_code(
             self.azimuth,
             self.elevation,
-            self.args.elevation_strength,
             self.device,
         )
 
@@ -209,12 +196,6 @@ def main():
     parser.add_argument("--window-size", type=int, default=512)
     parser.add_argument("--speed", type=float, default=45.0)
     parser.add_argument("--drag-sensitivity", type=float, default=0.5)
-    parser.add_argument(
-        "--elevation-strength",
-        type=float,
-        default=1.0,
-        help="How aggressively vertical movement pushes outside the learned orbit",
-    )
     args = parser.parse_args()
 
     app = OrbitPreview(args)
