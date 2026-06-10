@@ -21,13 +21,28 @@ class TreeFieldPreview:
         print(f"Device: {self.device}")
         if self.device.type == "cuda":
             print(torch.cuda.get_device_name(0))
+            torch.backends.cudnn.benchmark = True
 
         saved = torch.load(args.checkpoint, map_location=self.device)
         field_resolution = saved.get("field_resolution", 64)
         config_values = saved.get("camera_config", {})
 
-        self.config = CameraConfig(**config_values)
-        self.config.samples_per_ray = args.samples_per_ray or self.config.samples_per_ray
+        checkpoint_config = CameraConfig(**config_values)
+        self.training_resolution = checkpoint_config.width
+
+        preview_samples = args.samples_per_ray
+        if preview_samples is None:
+            preview_samples = min(checkpoint_config.samples_per_ray, 24)
+
+        self.config = CameraConfig(
+            width=args.render_resolution,
+            height=args.render_resolution,
+            fov_degrees=checkpoint_config.fov_degrees,
+            radius=checkpoint_config.radius,
+            near=checkpoint_config.near,
+            far=checkpoint_config.far,
+            samples_per_ray=preview_samples,
+        )
 
         self.model = DenseTreeField(field_resolution).to(self.device)
         self.model.load_state_dict(saved.get("model", saved))
@@ -59,12 +74,24 @@ class TreeFieldPreview:
         )
         self.info_label.pack(fill="x")
 
+        self.help_label = tk.Label(
+            self.root,
+            text="1: fast  2: balanced  3: quality  |  arrows/mouse: orbit  |  space: pause",
+            fg="#bbbbbb",
+            bg="black",
+            font=("Consolas", 10),
+        )
+        self.help_label.pack(fill="x")
+
         self.root.bind("<Left>", lambda event: self.step_azimuth(-1.0))
         self.root.bind("<Right>", lambda event: self.step_azimuth(1.0))
         self.root.bind("<Up>", lambda event: self.step_elevation(1.0))
         self.root.bind("<Down>", lambda event: self.step_elevation(-1.0))
         self.root.bind("<Home>", lambda event: self.reset_camera())
         self.root.bind("<space>", lambda event: self.toggle_play())
+        self.root.bind("<Key-1>", lambda event: self.set_quality(96, 12))
+        self.root.bind("<Key-2>", lambda event: self.set_quality(128, 24))
+        self.root.bind("<Key-3>", lambda event: self.set_quality(256, 32))
         self.root.bind("<Button-1>", self.start_drag)
         self.root.bind("<B1-Motion>", self.drag)
 
@@ -79,6 +106,12 @@ class TreeFieldPreview:
 
     def toggle_play(self):
         self.playing = not self.playing
+
+    def set_quality(self, resolution, samples):
+        self.config.width = resolution
+        self.config.height = resolution
+        self.config.samples_per_ray = samples
+        print(f"Preview quality: {resolution}x{resolution}, {samples} samples/ray")
 
     def step_azimuth(self, amount):
         self.playing = False
@@ -134,7 +167,7 @@ class TreeFieldPreview:
 
         with torch.inference_mode():
             with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                rgb, opacity, depth = self.model.render_image(
+                rgb, _, _ = self.model.render_image(
                     self.azimuth,
                     self.elevation,
                     self.config,
@@ -145,7 +178,7 @@ class TreeFieldPreview:
         image = tensor_to_image(rgb)
         image = image.resize(
             (self.args.window_size, self.args.window_size),
-            Image.Resampling.NEAREST,
+            Image.Resampling.BILINEAR,
         )
         self.photo = ImageTk.PhotoImage(image)
         self.image_label.configure(image=self.photo)
@@ -164,7 +197,8 @@ class TreeFieldPreview:
                 f"Azimuth: {self.azimuth:7.2f} deg   "
                 f"Elevation: {self.elevation:6.2f} deg   "
                 f"FPS: {self.live_fps:6.2f}   "
-                f"Samples/ray: {self.config.samples_per_ray}   "
+                f"Render: {self.config.width}²   "
+                f"Samples: {self.config.samples_per_ray}   "
                 f"{state}"
             )
         )
@@ -181,14 +215,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--window-size", type=int, default=512)
+    parser.add_argument(
+        "--render-resolution",
+        type=int,
+        default=128,
+        help="Internal ray-marched resolution; output is upscaled to window size",
+    )
     parser.add_argument("--speed", type=float, default=30.0)
     parser.add_argument("--drag-sensitivity", type=float, default=0.5)
-    parser.add_argument("--ray-chunk", type=int, default=2048)
+    parser.add_argument("--ray-chunk", type=int, default=16384)
     parser.add_argument(
         "--samples-per-ray",
         type=int,
         default=None,
-        help="Override checkpoint ray sample count for faster preview",
+        help="Defaults to at most 24 for interactive preview",
     )
     args = parser.parse_args()
 
