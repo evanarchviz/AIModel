@@ -104,7 +104,7 @@ class DenseTreeField(nn.Module):
         super().__init__()
         self.resolution = resolution
         self.density_grid = nn.Parameter(
-            torch.full((1, 1, resolution, resolution, resolution), -4.0)
+            torch.full((1, 1, resolution, resolution, resolution), -6.0)
         )
         self.color_grid = nn.Parameter(
             torch.zeros((1, 3, resolution, resolution, resolution))
@@ -112,9 +112,10 @@ class DenseTreeField(nn.Module):
 
     def sample_field(self, points):
         original_shape = points.shape[:-1]
+        inside = (points.abs() <= 1.0).all(dim=-1)
         grid = points.reshape(1, 1, 1, -1, 3)
 
-        density = F.grid_sample(
+        density_logits = F.grid_sample(
             self.density_grid,
             grid,
             mode="bilinear",
@@ -122,7 +123,7 @@ class DenseTreeField(nn.Module):
             align_corners=True,
         ).reshape(*original_shape)
 
-        color = F.grid_sample(
+        color_logits = F.grid_sample(
             self.color_grid,
             grid,
             mode="bilinear",
@@ -130,8 +131,8 @@ class DenseTreeField(nn.Module):
             align_corners=True,
         ).reshape(3, *original_shape).movedim(0, -1)
 
-        density = F.softplus(density)
-        color = torch.sigmoid(color)
+        density = F.softplus(density_logits) * inside.to(density_logits.dtype)
+        color = torch.sigmoid(color_logits) * inside[..., None].to(color_logits.dtype)
         return density, color
 
     def render_rays(self, ray_origins, ray_directions, config, randomized=False):
@@ -145,8 +146,10 @@ class DenseTreeField(nn.Module):
         )
 
         if randomized and self.training:
-            interval = (config.far - config.near) / config.samples_per_ray
+            interval = (config.far - config.near) / max(config.samples_per_ray - 1, 1)
             t_values = t_values + (torch.rand_like(t_values) - 0.5) * interval
+            t_values = t_values.clamp(config.near, config.far)
+            t_values, _ = torch.sort(t_values)
 
         points = (
             ray_origins[:, :, None, :]
@@ -156,7 +159,7 @@ class DenseTreeField(nn.Module):
         density, color = self.sample_field(points)
 
         deltas = t_values[1:] - t_values[:-1]
-        last_delta = torch.full_like(deltas[:1], 1e10)
+        last_delta = deltas[-1:].clone()
         deltas = torch.cat((deltas, last_delta), dim=0)
         deltas = deltas[None, None, :].expand(batch, ray_count, -1)
 
